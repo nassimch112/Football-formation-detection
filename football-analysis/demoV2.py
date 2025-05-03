@@ -106,9 +106,8 @@ def run_dynamic_analysis(video_path, output_dir, sample_rate=5):
     
     # Initialize components
     detector = PlayerDetector()
-    field_detector = FieldDetector()
+    field_detector = FieldDetector(detection_width=640)  # Initialize with desired width
     team_classifier = TeamClassifierV2()
-    team_classifier.set_field_detector(field_detector)  # Connect the two components
     
     # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
@@ -152,50 +151,24 @@ def run_dynamic_analysis(video_path, output_dir, sample_rate=5):
     # Process video
     frame_count = 0
     processed_count = 0
-    field_detected = False
-    all_positions = []
-    
+    current_field_mask = None
+    current_field_contour = None  # Store the contour in original coordinates
+    all_positions = []  # Initialize the list here
+
     print("Processing video...")
     progress_bar = tqdm(total=total_frames)
     
-    # First pass: try to detect field from several frames
-    print("Looking for field boundaries...")
-    field_detection_attempts = 0
-    max_attempts = 10
-    
-    # Sample frames throughout the video to find field
-    sample_points = [
-        int(total_frames * 0.1),   # 10% in
-        int(total_frames * 0.25),  # 25% in
-        int(total_frames * 0.5),   # Middle
-        int(total_frames * 0.75)   # 75% in
-    ]
-    
-    for frame_pos in sample_points:
-        if field_detected:
-            break
-            
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_pos)
-        
-        # Try several consecutive frames
-        for _ in range(5):
-            ret, frame = cap.read()
-            if not ret:
-                break
-                
-            field_mask, field_boundary = field_detector.detect_field(frame)
-            
-            if field_mask is not None:
-                print(f"Field detected at frame {frame_pos}")
-                field_detected = True
-                break
-                
-            field_detection_attempts += 1
-            if field_detection_attempts >= max_attempts:
-                break
-    
-    # Reset video to beginning
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    # Attempt initial field detection
+    print("Attempting initial field detection...")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * 0.1))  # Start 10% in
+    ret, initial_frame = cap.read()
+    if ret:
+        current_field_mask, current_field_contour = field_detector.detect_field(initial_frame)
+        if current_field_contour is not None:
+            print("Initial field detection successful.")
+        else:
+            print("Initial field detection failed, will try per frame.")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Reset video
     
     # Main processing loop
     while True:
@@ -212,18 +185,15 @@ def run_dynamic_analysis(video_path, output_dir, sample_rate=5):
             
         processed_count += 1
         
-        # 1. Detect field if not already detected or periodically refresh
-        if not field_detected or processed_count % 100 == 0:
-            field_mask, field_boundary = field_detector.detect_field(frame)
-            if field_mask is not None:
-                field_detected = True
+        # 1. Detect field
+        current_field_mask, current_field_contour = field_detector.detect_field(frame)
         
         # 2. Detect players
         bounding_boxes = detector.detect_players(frame)
         
         # 3. Filter players outside the field
-        if field_detected and field_mask is not None:
-            bounding_boxes = field_detector.filter_players(bounding_boxes)
+        if current_field_contour is not None:
+            bounding_boxes = filter_players_outside_contour(bounding_boxes, current_field_contour)
         
         # 4. Classify teams
         team_labels = team_classifier.classify_teams(bounding_boxes, frame)
@@ -244,8 +214,8 @@ def run_dynamic_analysis(video_path, output_dir, sample_rate=5):
         viz_frame = frame.copy()
         
         # Draw field boundary if detected
-        if field_detected and field_boundary is not None:
-            cv2.drawContours(viz_frame, [field_boundary], 0, (0, 255, 0), 2)
+        if current_field_contour is not None:
+            cv2.drawContours(viz_frame, [current_field_contour], 0, (0, 255, 0), 2)
         
         # Draw player bounding boxes with team colors
         for i, box in enumerate(bounding_boxes):
@@ -295,6 +265,28 @@ def run_dynamic_analysis(video_path, output_dir, sample_rate=5):
     print(f"\nAnalysis complete! Processed {processed_count} frames.")
     print(f"Output video: {output_video_path}")
     print(f"Heatmaps saved to: {os.path.join(output_dir, 'final_heatmaps')}")
+
+def filter_players_outside_contour(bounding_boxes, field_contour):
+    """Filters player bounding boxes based on whether their feet are inside the field contour."""
+    if field_contour is None or len(field_contour) == 0:
+        return bounding_boxes  # No filtering if contour is invalid
+
+    filtered_boxes = []
+    contour_for_test = field_contour.reshape(-1, 1, 2) if len(field_contour.shape) == 2 else field_contour
+
+    for box in bounding_boxes:
+        x, y, w, h = box
+        feet_x, feet_y = int(x + w//2), int(y + h)
+
+        try:
+            test_result = cv2.pointPolygonTest(contour_for_test, (float(feet_x), float(feet_y)), False)
+            if test_result >= 0:
+                filtered_boxes.append(box)
+        except Exception as poly_test_error:
+            print(f"Error during pointPolygonTest in filter: {poly_test_error}")
+            filtered_boxes.append(box)  # Include box if error occurs during test
+
+    return filtered_boxes
 
 if __name__ == "__main__":
     import argparse
